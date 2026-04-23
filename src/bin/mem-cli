@@ -1,0 +1,551 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mem-cli: Lightweight project memory for Claude Code
+# Stores observations in a per-project SQLite DB with FTS5 search.
+# Hooks call this directly; skills invoke it via Bash.
+
+# ---------------------------------------------------------------------------
+# DB location: look in the project dir for memory.db
+# ---------------------------------------------------------------------------
+find_db() {
+    local dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+    echo "${dir}/memory.db"
+}
+
+DB="$(find_db)"
+
+# Check if DB exists — used by hooks to go dormant
+db_exists() { [[ -f "$DB" ]]; }
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+SCHEMA='
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT UNIQUE NOT NULL,
+    project_dir TEXT NOT NULL,
+    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    ended_at TEXT,
+    summary TEXT
+);
+
+CREATE TABLE IF NOT EXISTS observations (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    type TEXT NOT NULL,
+    tool_name TEXT,
+    summary TEXT NOT NULL,
+    detail TEXT,
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
+    summary, detail,
+    content=observations, content_rowid=id
+);
+
+CREATE TRIGGER IF NOT EXISTS obs_ai AFTER INSERT ON observations BEGIN
+    INSERT INTO observations_fts(rowid, summary, detail)
+    VALUES (new.id, new.summary, new.detail);
+END;
+
+CREATE TRIGGER IF NOT EXISTS obs_ad AFTER DELETE ON observations BEGIN
+    INSERT INTO observations_fts(observations_fts, rowid, summary, detail)
+    VALUES ("delete", old.id, old.summary, old.detail);
+END;
+'
+
+# ---------------------------------------------------------------------------
+# Trivial commands to skip (capture filter)
+# ---------------------------------------------------------------------------
+TRIVIAL_COMMANDS="ls|cd|pwd|cat|head|tail|echo|which|whoami|date|file|wc|sort|mkdir|rm|cp|mv|chmod|chown|true|false|test|printf|type|realpath|dirname|basename|stat|touch|ln|readlink|tput|clear"
+TRIVIAL_GIT="git status|git log|git diff|git branch|git remote|git show|git tag|git stash list|git rev-parse"
+TRIVIAL_PKG="npm install|npm ci|pip install|pip3 install|dnf install|dnf update|yum install|yum update|brew install|brew update|brew upgrade|podman pull"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+sql() { sqlite3 -batch "$DB" "$@"; }
+
+truncate_str() {
+    local max="${1:-120}"
+    local str
+    str="$(cat)"
+    if (( ${#str} > max )); then
+        echo "${str:0:$max}..."
+    else
+        echo "$str"
+    fi
+}
+
+relative_time() {
+    local ts="$1"
+    local now
+    now="$(date -u +%s)"
+    local then_ts
+    then_ts="$(date -j -u -f '%Y-%m-%d %H:%M:%S' "$ts" +%s 2>/dev/null || echo "$now")"
+    local diff=$(( now - then_ts ))
+
+    if (( diff < 60 )); then echo "just now"
+    elif (( diff < 3600 )); then echo "$(( diff / 60 ))m ago"
+    elif (( diff < 86400 )); then echo "$(( diff / 3600 ))h ago"
+    else echo "$(( diff / 86400 ))d ago"
+    fi
+}
+
+# Extract the base command from a full command string for filtering
+base_command() {
+    local cmd="$1"
+    # Strip leading env vars (VAR=val cmd ...)
+    cmd="$(echo "$cmd" | sed 's/^[A-Za-z_][A-Za-z0-9_]*=[^ ]* *//')"
+    # Get first word, strip path
+    local first
+    first="$(echo "$cmd" | awk '{print $1}' | xargs basename 2>/dev/null || echo "$cmd")"
+    echo "$first"
+}
+
+# For git, get the subcommand too
+git_subcommand() {
+    local cmd="$1"
+    echo "$cmd" | grep -oE 'git [a-z-]+' | head -1
+}
+
+is_trivial() {
+    local cmd="$1"
+    local base
+    base="$(base_command "$cmd")"
+
+    # Check single-word trivial commands
+    if echo "$base" | grep -qwE "^($TRIVIAL_COMMANDS)$"; then
+        return 0
+    fi
+
+    # Check git subcommands
+    local gitsub
+    gitsub="$(git_subcommand "$cmd")"
+    if [[ -n "$gitsub" ]] && echo "$gitsub" | grep -qE "^($TRIVIAL_GIT)$"; then
+        return 0
+    fi
+
+    # Check package manager commands (first two words)
+    local two_words
+    two_words="$(echo "$cmd" | awk '{print $1, $2}')"
+    if echo "$two_words" | grep -qE "^($TRIVIAL_PKG)$"; then
+        return 0
+    fi
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_init() {
+    if db_exists; then
+        echo "memory.db already exists at $DB"
+        cmd_status
+        return 0
+    fi
+    sqlite3 "$DB" "$SCHEMA"
+    echo "Created memory.db at $DB"
+    echo "Memory capture is now active for this project."
+}
+
+cmd_status() {
+    if ! db_exists; then
+        echo "No memory.db in $(dirname "$DB")"
+        echo "Run 'mem-cli init' or use /memdb to create one."
+        return 0
+    fi
+    local sessions observations db_size last_session
+    sessions="$(sql "SELECT COUNT(*) FROM sessions;")"
+    observations="$(sql "SELECT COUNT(*) FROM observations;")"
+    db_size="$(du -h "$DB" | awk '{print $1}')"
+    last_session="$(sql "SELECT started_at FROM sessions ORDER BY started_at DESC LIMIT 1;" 2>/dev/null || echo "none")"
+
+    echo "=== mem-db status ==="
+    echo "DB: $DB ($db_size)"
+    echo "Sessions: $sessions"
+    echo "Observations: $observations"
+    echo "Last session: $last_session"
+}
+
+cmd_capture() {
+    # Called by PostToolUse hook — reads JSON from stdin
+    db_exists || exit 0
+
+    # Debug: log errors to file for diagnosis
+    exec 2>>"${DB%.db}.capture.log"
+    trap 'echo "[$(date -u +%FT%T)] TRAP: line $LINENO, exit $?" >&2' ERR
+
+    local input
+    input="$(cat)"
+
+    local tool_name session_id
+    tool_name="$(echo "$input" | jq -r '.tool_name // empty')"
+    session_id="$(echo "$input" | jq -r '.session_id // empty')"
+
+    [[ -z "$tool_name" ]] && exit 0
+    [[ -z "$session_id" ]] && exit 0
+
+    # Ensure session exists (in case capture fires before session-start)
+    local session_exists
+    session_exists="$(sql "SELECT COUNT(*) FROM sessions WHERE session_id='$session_id';")"
+    if [[ "$session_exists" == "0" ]]; then
+        local project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+        sql "INSERT OR IGNORE INTO sessions (session_id, project_dir) VALUES ('$session_id', '$project_dir');"
+    fi
+
+    local obs_type summary detail
+
+    case "$tool_name" in
+        Bash)
+            local command exit_code stdout_text stderr_text
+            command="$(echo "$input" | jq -r '.tool_input.command // empty')"
+            exit_code="$(echo "$input" | jq -r '.tool_output.exit_code // .tool_output.exitCode // "0"')"
+            stdout_text="$(echo "$input" | jq -r '.tool_output.stdout // .tool_output.output // empty')"
+            stderr_text="$(echo "$input" | jq -r '.tool_output.stderr // empty')"
+
+            # Skip trivial commands (unless they failed)
+            if [[ "$exit_code" == "0" ]] && is_trivial "$command"; then
+                exit 0
+            fi
+
+            if [[ "$exit_code" != "0" ]]; then
+                obs_type="error"
+                summary="[FAIL:$exit_code] $(echo "$command" | truncate_str 110)"
+            else
+                obs_type="command"
+                summary="[OK] $(echo "$command" | truncate_str 115)"
+            fi
+
+            local output_text="${stdout_text}${stderr_text:+
+STDERR: $stderr_text}"
+            detail="$(printf 'CMD: %s\nEXIT: %s\n%s' "$command" "$exit_code" "$(echo "$output_text" | head -c 500)")"
+            ;;
+
+        Edit)
+            obs_type="edit"
+            local file_path old_string new_string
+            file_path="$(echo "$input" | jq -r '.tool_input.file_path // empty')"
+            old_string="$(echo "$input" | jq -r '.tool_input.old_string // empty')"
+            new_string="$(echo "$input" | jq -r '.tool_input.new_string // empty')"
+
+            local first_line
+            first_line="$(echo "$old_string" | head -1 | truncate_str 60)"
+            summary="Edited ${file_path##*/} — ${first_line}"
+
+            detail="$(printf 'FILE: %s\nOLD:\n%.200s\nNEW:\n%.200s' "$file_path" "$old_string" "$new_string")"
+            ;;
+
+        Write)
+            obs_type="write"
+            local file_path content
+            file_path="$(echo "$input" | jq -r '.tool_input.file_path // empty')"
+            content="$(echo "$input" | jq -r '.tool_input.content // empty')"
+
+            summary="Created ${file_path##*/}"
+            detail="$(printf 'FILE: %s\nCONTENT:\n%.300s' "$file_path" "$content")"
+            ;;
+
+        *)
+            # Unknown tool — skip
+            exit 0
+            ;;
+    esac
+
+    # Escape single quotes for SQL (sed is unambiguous; bash ${//} mangles \' in replacements)
+    summary="$(printf '%s' "$summary" | sed "s/'/''/g")"
+    detail="$(printf '%s' "$detail" | sed "s/'/''/g")"
+    session_id="$(printf '%s' "$session_id" | sed "s/'/''/g")"
+
+    # Dedup: skip if last observation in this session has identical summary
+    local last_summary
+    last_summary="$(sql "SELECT summary FROM observations WHERE session_id='$session_id' ORDER BY id DESC LIMIT 1;")"
+    if [[ "$last_summary" == "$summary" ]]; then
+        exit 0
+    fi
+
+    # Use stdin pipe to avoid shell re-interpretation of backslashes/special chars
+    printf "INSERT INTO observations (session_id, type, tool_name, summary, detail)
+         VALUES ('%s', '%s', '%s', '%s', '%s');\n" \
+         "$session_id" "$obs_type" "$tool_name" "$summary" "$detail" \
+         | sqlite3 -batch "$DB"
+}
+
+cmd_session_start() {
+    # Called by SessionStart hook — reads JSON from stdin
+    db_exists || exit 0
+
+    local input
+    input="$(cat)"
+
+    local session_id source project_dir
+    session_id="$(echo "$input" | jq -r '.session_id // empty')"
+    source="$(echo "$input" | jq -r '.source // .type // "startup"')"
+    project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+    [[ -z "$session_id" ]] && exit 0
+
+    # Register session (ignore if already exists from resume)
+    sql "INSERT OR IGNORE INTO sessions (session_id, project_dir) VALUES ('$session_id', '$project_dir');"
+
+    # Get previous session info
+    local prev_session prev_date prev_obs_count
+    prev_session="$(sql "SELECT session_id FROM sessions WHERE session_id != '$session_id' ORDER BY started_at DESC LIMIT 1;")"
+
+    if [[ -z "$prev_session" ]]; then
+        # No previous sessions — nothing to inject
+        if [[ "$source" == "compact" ]]; then
+            # After compaction, inject current session observations
+            local current_obs
+            current_obs="$(sql "SELECT '#' || id || ' (' || type || ') ' || summary FROM observations WHERE session_id='$session_id' ORDER BY timestamp DESC LIMIT 10;")"
+            if [[ -n "$current_obs" ]]; then
+                echo "[mem-db] Context restored after compaction:"
+                echo "$current_obs" | while IFS= read -r line; do
+                    echo "[mem-db]   $line"
+                done
+            fi
+        fi
+        exit 0
+    fi
+
+    prev_date="$(sql "SELECT started_at FROM sessions WHERE session_id='$prev_session';")"
+    prev_obs_count="$(sql "SELECT COUNT(*) FROM observations WHERE session_id='$prev_session';")"
+
+    # Build injection output
+    echo "[mem-db] Previous session: $prev_date ($prev_obs_count observations)"
+
+    # Recent observations from previous sessions (not current)
+    local recent
+    recent="$(sql "SELECT '#' || id || ' (' || type || ') ' || summary FROM observations WHERE session_id != '$session_id' ORDER BY timestamp DESC LIMIT 5;")"
+
+    if [[ -n "$recent" ]]; then
+        echo "[mem-db] Recent activity:"
+        echo "$recent" | while IFS= read -r line; do
+            echo "[mem-db]   $line"
+        done
+    fi
+
+    # If compacting, also show current session observations
+    if [[ "$source" == "compact" ]]; then
+        local current_obs
+        current_obs="$(sql "SELECT '#' || id || ' (' || type || ') ' || summary FROM observations WHERE session_id='$session_id' ORDER BY timestamp DESC LIMIT 10;")"
+        if [[ -n "$current_obs" ]]; then
+            echo "[mem-db] Current session activity:"
+            echo "$current_obs" | while IFS= read -r line; do
+                echo "[mem-db]   $line"
+            done
+        fi
+    fi
+}
+
+cmd_session_end() {
+    # Called by SessionEnd hook — reads JSON from stdin
+    db_exists || exit 0
+
+    local input
+    input="$(cat)"
+
+    local session_id
+    session_id="$(echo "$input" | jq -r '.session_id // empty')"
+
+    [[ -z "$session_id" ]] && exit 0
+
+    sql "UPDATE sessions SET ended_at = datetime('now') WHERE session_id = '$session_id';"
+}
+
+cmd_prompt_search() {
+    # Called by UserPromptSubmit hook — reads JSON from stdin
+    db_exists || exit 0
+
+    local input
+    input="$(cat)"
+
+    local prompt
+    prompt="$(echo "$input" | jq -r '.user_prompt // .prompt // .content // empty')"
+
+    [[ -z "$prompt" ]] && exit 0
+
+    # Extract keywords: remove short words and common stop words
+    local keywords
+    keywords="$(echo "$prompt" | tr '[:upper:]' '[:lower:]' | \
+        tr -cs '[:alnum:]' ' ' | \
+        tr ' ' '\n' | \
+        grep -vE '^(the|a|an|is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|could|should|can|may|might|shall|must|not|no|and|or|but|if|then|else|when|where|what|which|who|whom|how|why|this|that|these|those|it|its|i|me|my|we|our|you|your|he|she|they|them|to|of|in|for|on|with|at|by|from|as|into|about|up|out|so|just|also|very|too|here|there|now|all|any|some|each|every|than|more|most|only|own|same|such|get|got|make|go|take|use|want|need|try|let|say|tell|give|come|think|look|see|find|know|like|help)$' | \
+        awk 'length >= 3' | \
+        head -20 | \
+        paste -sd ' ' -)"
+
+    [[ -z "$keywords" ]] && exit 0
+
+    # Build FTS5 query with OR
+    local fts_query
+    fts_query="$(echo "$keywords" | sed 's/ / OR /g')"
+
+    # Search and return top 3 tier 1 results
+    local results
+    results="$(sql "SELECT '#' || o.id || ' (' || o.type || ') ' || o.summary
+        FROM observations o
+        JOIN observations_fts f ON o.id = f.rowid
+        WHERE observations_fts MATCH '$fts_query'
+        ORDER BY rank
+        LIMIT 3;" 2>/dev/null || true)"
+
+    if [[ -n "$results" ]]; then
+        echo "[mem-db] Related memories:"
+        echo "$results" | while IFS= read -r line; do
+            echo "[mem-db]   $line"
+        done
+    fi
+}
+
+cmd_search() {
+    # Manual tier 1 search — called from /mem skill or directly
+    db_exists || { echo "No memory.db found. Run /memdb first."; exit 1; }
+
+    local query="${1:-}"
+    [[ -z "$query" ]] && { echo "Usage: mem-cli search <query>"; exit 1; }
+
+    # Escape single quotes
+    query="${query//\'/\'\'}"
+
+    local results
+    results="$(sql "SELECT '#' || o.id || ' | ' || o.timestamp || ' | ' || o.type || ' | ' || o.summary
+        FROM observations o
+        JOIN observations_fts f ON o.id = f.rowid
+        WHERE observations_fts MATCH '\"$query\"'
+        ORDER BY rank
+        LIMIT 15;")"
+
+    if [[ -z "$results" ]]; then
+        echo "No matches for: $query"
+    else
+        printf '%-5s | %-19s | %-8s | %s\n' "ID" "TIMESTAMP" "TYPE" "SUMMARY"
+        printf '%s\n' "------+---------------------+----------+------------------------------------------"
+        echo "$results" | while IFS='|' read -r id ts typ summary; do
+            printf '%s|%s|%s|%s\n' "$id" "$ts" "$typ" "$summary"
+        done
+    fi
+}
+
+cmd_timeline() {
+    # Tier 2: chronological context around an observation
+    db_exists || { echo "No memory.db found. Run /memdb first."; exit 1; }
+
+    local obs_id="${1:-}"
+    [[ -z "$obs_id" ]] && { echo "Usage: mem-cli timeline <observation-id>"; exit 1; }
+
+    # Get the timestamp of the target observation
+    local target_ts
+    target_ts="$(sql "SELECT timestamp FROM observations WHERE id = $obs_id;" 2>/dev/null)"
+    [[ -z "$target_ts" ]] && { echo "Observation #$obs_id not found."; exit 1; }
+
+    echo "=== Timeline around #$obs_id ($target_ts) ==="
+    echo ""
+
+    sql "SELECT CASE WHEN id = $obs_id THEN '>>>' ELSE '   ' END || ' #' || id || ' | ' || timestamp || ' | ' || type || ' | ' || summary
+        FROM observations
+        WHERE timestamp BETWEEN datetime('$target_ts', '-1 hour') AND datetime('$target_ts', '+1 hour')
+        ORDER BY timestamp;"
+}
+
+cmd_detail() {
+    # Tier 3: full observation content
+    db_exists || { echo "No memory.db found. Run /memdb first."; exit 1; }
+
+    local obs_id="${1:-}"
+    [[ -z "$obs_id" ]] && { echo "Usage: mem-cli detail <observation-id>"; exit 1; }
+
+    local row
+    row="$(sql -separator '|' "SELECT id, session_id, timestamp, type, tool_name, summary, detail FROM observations WHERE id = $obs_id;")"
+    [[ -z "$row" ]] && { echo "Observation #$obs_id not found."; exit 1; }
+
+    local id session_id timestamp obs_type tool_name summary detail
+    IFS='|' read -r id session_id timestamp obs_type tool_name summary detail <<< "$row"
+
+    echo "=== Observation #$id ==="
+    echo "Session:   $session_id"
+    echo "Time:      $timestamp"
+    echo "Type:      $obs_type"
+    echo "Tool:      $tool_name"
+    echo "Summary:   $summary"
+    echo ""
+    echo "--- Detail ---"
+    echo "$detail"
+}
+
+cmd_prune() {
+    db_exists || { echo "No memory.db found."; exit 1; }
+
+    local days=30
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days) days="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local count
+    count="$(sql "SELECT COUNT(*) FROM observations WHERE timestamp < datetime('now', '-$days days');")"
+
+    if [[ "$count" == "0" ]]; then
+        echo "No observations older than $days days."
+        return 0
+    fi
+
+    sql "DELETE FROM observations WHERE timestamp < datetime('now', '-$days days');"
+    # Rebuild FTS index after bulk delete
+    sql "INSERT INTO observations_fts(observations_fts) VALUES('rebuild');"
+
+    echo "Pruned $count observations older than $days days."
+
+    # Also clean up orphaned sessions
+    sql "DELETE FROM sessions WHERE session_id NOT IN (SELECT DISTINCT session_id FROM observations) AND ended_at IS NOT NULL;"
+}
+
+cmd_help() {
+    cat <<'HELP'
+mem-cli: Lightweight project memory for Claude Code
+
+Usage: mem-cli <command> [args]
+
+Commands:
+  init                  Create memory.db in the current project
+  status                Show database stats
+  capture               [hook] Capture observation from PostToolUse JSON on stdin
+  session-start         [hook] Register session from SessionStart JSON on stdin
+  session-end           [hook] Close session from SessionEnd JSON on stdin
+  prompt-search         [hook] Search memory against UserPromptSubmit JSON on stdin
+  search <query>        Tier 1: FTS5 keyword search
+  timeline <id>         Tier 2: Chronological context around an observation
+  detail <id>           Tier 3: Full observation content
+  prune --days N        Remove observations older than N days (default: 30)
+  help                  Show this help
+
+The DB file (memory.db) lives in the project wrapper directory.
+Hooks are dormant when no memory.db exists.
+HELP
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+case "${1:-help}" in
+    init)           cmd_init ;;
+    status)         cmd_status ;;
+    capture)        cmd_capture ;;
+    session-start)  cmd_session_start ;;
+    session-end)    cmd_session_end ;;
+    prompt-search)  cmd_prompt_search ;;
+    search)         shift; cmd_search "$@" ;;
+    timeline)       shift; cmd_timeline "$@" ;;
+    detail)         shift; cmd_detail "$@" ;;
+    prune)          shift; cmd_prune "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)              echo "Unknown command: $1"; cmd_help; exit 1 ;;
+esac

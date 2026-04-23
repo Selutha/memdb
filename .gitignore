@@ -1,0 +1,9 @@
+# Local state — each station maintains its own
+memory.db
+memory.capture.log
+
+# Third-party reference clone — has its own origin
+context/claude-mem/
+
+# Claude Code project-local state
+.claude/
