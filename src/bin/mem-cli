@@ -107,10 +107,25 @@ base_command() {
     echo "$first"
 }
 
-# For git, get the subcommand too
+# For git, return "git <subcommand>", skipping the global options that can sit
+# between "git" and the subcommand (-C <path>, -c <name>=<value>, --git-dir=...,
+# etc.). Without this, "git -C /path status" reads as a non-trivial command and
+# gets captured as noise.
 git_subcommand() {
     local cmd="$1"
-    echo "$cmd" | grep -oE 'git [a-z-]+' | head -1
+    awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i != "git") continue
+            i++
+            while (i <= NF) {
+                if ($i == "-C" || $i == "-c") { i += 2; continue }  # flag consumes its argument
+                if ($i ~ /^-/) { i++; continue }                    # other flag, single token
+                print "git " $i
+                exit
+            }
+            exit
+        }
+    }' <<< "$cmd"
 }
 
 is_trivial() {
