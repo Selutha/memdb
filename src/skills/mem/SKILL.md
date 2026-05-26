@@ -2,7 +2,7 @@
 name: mem
 description: Query the project memory database. Search past observations, view timelines, or get full details. Use when you need to recall what happened in previous sessions.
 allowed-tools: Bash
-argument-hint: [search|timeline|detail|prune] [query or id]
+argument-hint: [search|timeline|detail|prune|backfill] [query or id]
 ---
 
 # Memory Query
@@ -27,6 +27,11 @@ Based on the first argument, run the corresponding mem-cli command:
 
 - `prune --days N`: Run `$HOME/.claude/bin/mem-cli prune --days <N>`
   Removes observations older than N days. Default is 30 days.
+
+- `backfill [--force]`: Run `$HOME/.claude/bin/mem-cli backfill`
+  Computes session summaries for sessions missing one (the "where you left off"
+  digest shown at SessionStart). Add `--force` to recompute all sessions, e.g.
+  after the summary format changes. Maintenance command, not a query.
 
 ## Workflow
 
