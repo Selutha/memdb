@@ -140,6 +140,26 @@ is_trivial() {
     return 1
 }
 
+# Build a safe FTS5 MATCH query from arbitrary text.
+# Lowercases, splits on non-alphanumeric, wraps each token as a quoted phrase
+# (immune to FTS5 operator interpretation — hyphens, NEAR/AND/OR, etc.), and
+# joins them with $op (default OR). Tokens shorter than 2 chars are dropped.
+# Returns empty if there are no usable tokens.
+fts_escape() {
+    local raw="$1"
+    local op="${2:-OR}"
+    local query="" token
+    for token in $(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' ' '); do
+        (( ${#token} < 2 )) && continue
+        if [[ -z "$query" ]]; then
+            query="\"$token\""
+        else
+            query="$query $op \"$token\""
+        fi
+    done
+    printf '%s' "$query"
+}
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -317,8 +337,12 @@ cmd_session_start() {
     prev_date="$(sql "SELECT started_at FROM sessions WHERE session_id='$prev_session';")"
     prev_obs_count="$(sql "SELECT COUNT(*) FROM observations WHERE session_id='$prev_session';")"
 
+    local prev_summary
+    prev_summary="$(sql "SELECT COALESCE(summary,'') FROM sessions WHERE session_id='$prev_session';")"
+
     # Build injection output
     echo "[mem-db] Previous session: $prev_date ($prev_obs_count observations)"
+    [[ -n "$prev_summary" ]] && echo "[mem-db]   ↳ $prev_summary"
 
     # Recent observations from previous sessions (not current)
     local recent
@@ -356,7 +380,26 @@ cmd_session_end() {
 
     [[ -z "$session_id" ]] && exit 0
 
-    sql "UPDATE sessions SET ended_at = datetime('now') WHERE session_id = '$session_id';"
+    local sid_esc
+    sid_esc="$(printf '%s' "$session_id" | sed "s/'/''/g")"
+
+    # Build a mechanical digest of this session: counts + distinct files touched.
+    # No LLM available in a hook, so derive the summary from captured observations.
+    local edits writes commands files summary_text
+    edits="$(sql "SELECT COUNT(*) FROM observations WHERE session_id='$sid_esc' AND type='edit';")"
+    writes="$(sql "SELECT COUNT(*) FROM observations WHERE session_id='$sid_esc' AND type='write';")"
+    commands="$(sql "SELECT COUNT(*) FROM observations WHERE session_id='$sid_esc' AND type IN ('command','error');")"
+
+    # Filenames live at the front of edit/write summaries: "Edited <f> — ..." / "Created <f>"
+    files="$(sql "SELECT summary FROM observations WHERE session_id='$sid_esc' AND type IN ('edit','write');" \
+        | sed -E 's/^Edited ([^ ]+) .*/\1/; s/^Created (.+)$/\1/' \
+        | sort -u | grep -v '^$' | head -8 | paste -sd ',' - | sed 's/,/, /g')"
+
+    summary_text="${edits} edits, ${writes} writes, ${commands} cmds"
+    [[ -n "$files" ]] && summary_text="${summary_text} — ${files}"
+    summary_text="$(printf '%s' "$summary_text" | sed "s/'/''/g")"
+
+    sql "UPDATE sessions SET ended_at = datetime('now'), summary = '$summary_text' WHERE session_id = '$sid_esc';"
 }
 
 cmd_prompt_search() {
@@ -383,9 +426,11 @@ cmd_prompt_search() {
 
     [[ -z "$keywords" ]] && exit 0
 
-    # Build FTS5 query with OR
+    # Build FTS5 query: each keyword as a quoted phrase, OR-joined
     local fts_query
-    fts_query="$(echo "$keywords" | sed 's/ / OR /g')"
+    fts_query="$(fts_escape "$keywords" OR)"
+    [[ -z "$fts_query" ]] && exit 0
+    fts_query="${fts_query//\'/\'\'}"
 
     # Search and return top 3 tier 1 results
     local results
@@ -411,14 +456,17 @@ cmd_search() {
     local query="${1:-}"
     [[ -z "$query" ]] && { echo "Usage: mem-cli search <query>"; exit 1; }
 
-    # Escape single quotes
-    query="${query//\'/\'\'}"
+    # Tokenize + quote each term (OR-joined); ranks best matches first
+    local fts_query
+    fts_query="$(fts_escape "$query" OR)"
+    [[ -z "$fts_query" ]] && { echo "No searchable terms in: $query"; exit 1; }
+    fts_query="${fts_query//\'/\'\'}"
 
     local results
     results="$(sql "SELECT '#' || o.id || ' | ' || o.timestamp || ' | ' || o.type || ' | ' || o.summary
         FROM observations o
         JOIN observations_fts f ON o.id = f.rowid
-        WHERE observations_fts MATCH '\"$query\"'
+        WHERE observations_fts MATCH '$fts_query'
         ORDER BY rank
         LIMIT 15;")"
 
