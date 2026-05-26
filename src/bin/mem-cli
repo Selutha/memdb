@@ -380,11 +380,18 @@ cmd_session_end() {
 
     [[ -z "$session_id" ]] && exit 0
 
-    local sid_esc
+    local sid_esc summary_text
     sid_esc="$(printf '%s' "$session_id" | sed "s/'/''/g")"
+    summary_text="$(compute_session_summary "$sid_esc")"
 
-    # Build a mechanical digest of this session: counts + distinct files touched.
-    # No LLM available in a hook, so derive the summary from captured observations.
+    sql "UPDATE sessions SET ended_at = datetime('now'), summary = '$summary_text' WHERE session_id = '$sid_esc';"
+}
+
+# Build a mechanical digest for a session: counts + distinct files touched.
+# No LLM available in a hook, so derive it from captured observations. Takes a
+# SQL-escaped session id and echoes the summary text (single quotes escaped).
+compute_session_summary() {
+    local sid_esc="$1"
     local edits writes commands files summary_text
     edits="$(sql "SELECT COUNT(*) FROM observations WHERE session_id='$sid_esc' AND type='edit';")"
     writes="$(sql "SELECT COUNT(*) FROM observations WHERE session_id='$sid_esc' AND type='write';")"
@@ -397,9 +404,7 @@ cmd_session_end() {
 
     summary_text="${edits} edits, ${writes} writes, ${commands} cmds"
     [[ -n "$files" ]] && summary_text="${summary_text} — ${files}"
-    summary_text="$(printf '%s' "$summary_text" | sed "s/'/''/g")"
-
-    sql "UPDATE sessions SET ended_at = datetime('now'), summary = '$summary_text' WHERE session_id = '$sid_esc';"
+    printf '%s' "$summary_text" | sed "s/'/''/g"
 }
 
 cmd_prompt_search() {
@@ -556,6 +561,35 @@ cmd_prune() {
     sql "DELETE FROM sessions WHERE session_id NOT IN (SELECT DISTINCT session_id FROM observations) AND ended_at IS NOT NULL;"
 }
 
+cmd_backfill() {
+    db_exists || { echo "No memory.db found. Run /memdb first."; exit 1; }
+
+    # By default only fill sessions missing a summary; --force recomputes all.
+    local where="summary IS NULL OR summary = ''"
+    [[ "${1:-}" == "--force" ]] && where="1=1"
+
+    local sessions
+    sessions="$(sql "SELECT session_id FROM sessions WHERE $where ORDER BY started_at;")"
+    if [[ -z "$sessions" ]]; then
+        echo "No sessions need backfilling."
+        return 0
+    fi
+
+    # Only touches the summary column — leaves ended_at untouched so open
+    # sessions aren't falsely marked closed and real end times aren't rewritten.
+    local count=0 sid sid_esc summary_text
+    while IFS= read -r sid; do
+        [[ -z "$sid" ]] && continue
+        sid_esc="$(printf '%s' "$sid" | sed "s/'/''/g")"
+        summary_text="$(compute_session_summary "$sid_esc")"
+        sql "UPDATE sessions SET summary = '$summary_text' WHERE session_id = '$sid_esc';"
+        echo "  ${sid:0:8} — $summary_text"
+        count=$((count + 1))
+    done <<< "$sessions"
+
+    echo "Backfilled $count session(s)."
+}
+
 cmd_help() {
     cat <<'HELP'
 mem-cli: Lightweight project memory for Claude Code
@@ -573,6 +607,8 @@ Commands:
   timeline <id>         Tier 2: Chronological context around an observation
   detail <id>           Tier 3: Full observation content
   prune --days N        Remove observations older than N days (default: 30)
+  backfill [--force]    Compute session summaries for sessions missing one
+                        (--force recomputes all, e.g. after a format change)
   help                  Show this help
 
 The DB file (memory.db) lives in the project wrapper directory.
@@ -594,6 +630,7 @@ case "${1:-help}" in
     timeline)       shift; cmd_timeline "$@" ;;
     detail)         shift; cmd_detail "$@" ;;
     prune)          shift; cmd_prune "$@" ;;
+    backfill)       shift; cmd_backfill "$@" ;;
     help|--help|-h) cmd_help ;;
     *)              echo "Unknown command: $1"; cmd_help; exit 1 ;;
 esac
